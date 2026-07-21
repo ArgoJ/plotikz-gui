@@ -134,7 +134,7 @@ def convert_contour_to_scatters(trace, dest_dir=None, base_filename="contour_bg"
         if levels is not None:
             cs = ax_temp.contour(X, Y, z, levels=levels, cmap=cmap_name)
         else:
-            cs = ax_temp.contour(X, Y, z, levels=4, cmap=cmap_name)
+            cs = ax_temp.contour(X, Y, z, levels=5, cmap=cmap_name)
             
         cmap = cs.get_cmap()
         norm = cs.norm
