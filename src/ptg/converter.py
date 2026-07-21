@@ -29,17 +29,247 @@ def decode_bdata(obj):
     return obj
 
 
-def extract_plotly_fig(html_path: Union[str, Path]) -> go.Figure:
+import re
+
+def clean_identifier(text: str) -> str:
+    """
+    Strips LaTeX math markup and special characters to create a clean,
+    valid pgfplots column name identifier (e.g. '$\\text{ROA}$' -> 'ROA').
+    """
+    if not text:
+        return "y"
+    cleaned = re.sub(r'\\[a-zA-Z]+\{([^}]*)\}', r'\1', text)
+    cleaned = re.sub(r'[\$\\\{\}\(\)\[\]]', '', cleaned)
+    cleaned = re.sub(r'[^a-zA-Z0-9_]', '_', cleaned)
+    cleaned = re.sub(r'_+', '_', cleaned).strip('_')
+    return cleaned or "y"
+
+
+def convert_contour_to_scatters(trace, dest_dir=None, base_filename="contour_bg") -> tuple:
+    """
+    Converts a Plotly contour trace into multiple Plotly scatter traces
+    representing the contour lines, using Matplotlib's contour generator.
+    Optionally generates a background filled contour PNG image.
+    """
+    import numpy as np
+    import matplotlib
+    import matplotlib.pyplot as plt
+    
+    # Use non-interactive backend
+    matplotlib.use('Agg')
+    
+    z = np.array(trace.z)
+    
+    # x and y can be 1D arrays or default to range
+    if getattr(trace, 'x', None) is not None:
+        x = np.array(trace.x)
+    else:
+        x = None
+        
+    if getattr(trace, 'y', None) is not None:
+        y = np.array(trace.y)
+    else:
+        y = None
+
+    if z.ndim == 1:
+        if x is not None and y is not None:
+            z = z.reshape(len(y), len(x))
+        else:
+            n = int(np.sqrt(z.size))
+            z = z.reshape(n, n)
+
+    if x is None:
+        x = np.arange(z.shape[1])
+    if y is None:
+        y = np.arange(z.shape[0])
+        
+    if x.ndim == 1 and y.ndim == 1:
+        X, Y = np.meshgrid(x, y)
+    else:
+        X, Y = x, y
+        
+    levels = None
+    c_opt = getattr(trace, 'contours', None)
+    is_constraint = False
+    
+    if c_opt is not None:
+        # Check if this is a constraint contour (e.g. ROA level)
+        if getattr(c_opt, 'type', None) == 'constraint' or getattr(c_opt, 'value', None) is not None:
+            val = getattr(c_opt, 'value', None)
+            if val is not None:
+                levels = [val]
+                is_constraint = True
+        elif getattr(c_opt, 'start', None) is not None and getattr(c_opt, 'end', None) is not None:
+            step = getattr(c_opt, 'size', None) or 1.0
+            levels = np.arange(c_opt.start, c_opt.end + step, step)
+            
+    cmap_name = 'viridis'
+    if getattr(trace, 'colorscale', None) is not None:
+        colorscale = trace.colorscale
+        if isinstance(colorscale, str):
+            plotly_to_mpl_cmaps = {
+                'blackbody': 'gist_heat', 'bluered': 'RdBu_r', 'blues': 'Blues',
+                'earth': 'gist_earth', 'electric': 'hot', 'greens': 'Greens',
+                'greys': 'Greys', 'hot': 'hot', 'jet': 'jet', 'picnic': 'rainbow',
+                'portland': 'rainbow', 'rainbow': 'rainbow', 'rdbu': 'RdBu',
+                'reds': 'Reds', 'twilight': 'twilight', 'viridis': 'viridis',
+                'cividis': 'cividis', 'inferno': 'inferno', 'magma': 'magma',
+                'plasma': 'plasma'
+            }
+            c_lower = colorscale.lower()
+            cmap_name = plotly_to_mpl_cmaps.get(c_lower, 'viridis')
+
+    trace_line = getattr(trace, 'line', None)
+    custom_color = getattr(trace_line, 'color', None) if trace_line else None
+    custom_dash = getattr(trace_line, 'dash', None) if trace_line else None
+    custom_width = getattr(trace_line, 'width', None) if trace_line else None
+    if custom_width is None:
+        custom_width = 0.3 if custom_color is None else 0.5
+            
+    fig_temp, ax_temp = plt.subplots()
+    new_traces = []
+    contour_meta = None
+    
+    try:
+        if levels is not None:
+            cs = ax_temp.contour(X, Y, z, levels=levels, cmap=cmap_name)
+        else:
+            cs = ax_temp.contour(X, Y, z, cmap=cmap_name)
+            
+        cmap = cs.get_cmap()
+        norm = cs.norm
+        level_colors = [cmap(norm(val)) for val in cs.levels]
+        raw_trace_name = getattr(trace, 'name', None) or 'Contour'
+        base_name = clean_identifier(raw_trace_name)
+        
+        # Save background filled contour image if requested and NOT a single constraint line
+        if dest_dir is not None and not is_constraint and custom_color is None:
+            bg_filename = f"{base_filename}.png"
+            bg_path = Path(dest_dir) / bg_filename
+            
+            fig_bg, ax_bg = plt.subplots(figsize=(8, 8))
+            ax_bg.axis('off')
+            fig_bg.subplots_adjust(left=0, right=1, bottom=0, top=1)
+            
+            try:
+                ax_bg.pcolormesh(X, Y, z, cmap=cmap_name, shading='gouraud')
+                fig_bg.savefig(bg_path, dpi=300, bbox_inches='tight', pad_inches=0)
+                
+                contour_meta = {
+                    "bg_filename": bg_filename,
+                    "xmin": float(np.min(X)),
+                    "xmax": float(np.max(X)),
+                    "ymin": float(np.min(Y)),
+                    "ymax": float(np.max(Y)),
+                    "zmin": float(np.min(z)),
+                    "zmax": float(np.max(z)),
+                    "cmap": cmap_name,
+                    "levels": [float(lvl) for lvl in cs.levels],
+                }
+            except Exception:
+                pass
+            finally:
+                plt.close(fig_bg)
+        
+        # Iterate over paths (levels) using allsegs
+        if hasattr(cs, 'allsegs') and cs.allsegs:
+            for level_idx, level_val in enumerate(cs.levels):
+                if custom_color:
+                    plotly_color = custom_color
+                else:
+                    plotly_color = 'black'
+                
+                show_legend_for_level = (getattr(trace, 'showlegend', True) is not False)
+                seg_count = 0
+                for segment in cs.allsegs[level_idx]:
+                    if len(segment) < 2:
+                        continue
+                    x_seg = segment[:, 0].tolist()
+                    y_seg = segment[:, 1].tolist()
+                    
+                    if is_constraint:
+                        clean_name = base_name
+                    else:
+                        level_str = f"{level_val:.2f}".replace('-', 'neg_').replace('.', '_')
+                        clean_name = f"{base_name}_L_{level_str}"
+                    
+                    line_dict = dict(color=plotly_color, width=custom_width)
+                    if custom_dash:
+                        line_dict['dash'] = custom_dash
+                    
+                    scatter_trace = go.Scatter(
+                        x=x_seg,
+                        y=y_seg,
+                        mode='lines',
+                        line=line_dict,
+                        name=clean_name,
+                        showlegend=show_legend_for_level if seg_count == 0 else False,
+                        legendgroup=f"level_{level_val:.2f}"
+                    )
+                    new_traces.append(scatter_trace)
+                    seg_count += 1
+        else:
+            # Fallback using collections
+            for level_idx, collection in enumerate(cs.collections):
+                level_val = cs.levels[level_idx]
+                if custom_color:
+                    plotly_color = custom_color
+                else:
+                    plotly_color = 'black'
+                
+                show_legend_for_level = (getattr(trace, 'showlegend', True) is not False)
+                paths = collection.get_paths()
+                seg_count = 0
+                for path in paths:
+                    polys = path.to_polygons()
+                    for poly in polys:
+                        if len(poly) < 2:
+                            continue
+                        x_seg = poly[:, 0].tolist()
+                        y_seg = poly[:, 1].tolist()
+                        
+                        if is_constraint:
+                            clean_name = base_name
+                        else:
+                            level_str = f"{level_val:.2f}".replace('-', 'neg_').replace('.', '_')
+                            clean_name = f"{base_name}_L_{level_str}"
+                        
+                        line_dict = dict(color=plotly_color, width=custom_width)
+                        if custom_dash:
+                            line_dict['dash'] = custom_dash
+                        
+                        scatter_trace = go.Scatter(
+                            x=x_seg,
+                            y=y_seg,
+                            mode='lines',
+                            line=line_dict,
+                            name=clean_name,
+                            showlegend=show_legend_for_level if seg_count == 0 else False,
+                            legendgroup=f"level_{level_val:.2f}"
+                        )
+                        new_traces.append(scatter_trace)
+                        seg_count += 1
+    finally:
+        plt.close(fig_temp)
+        
+    return new_traces, contour_meta
+
+
+def extract_plotly_fig(html_path: Union[str, Path], output_path: Union[str, Path, None] = None) -> tuple:
     """
     Extracts a Plotly Figure object from an HTML file containing a Plotly plot.
 
     :param html_path: Path to the HTML file.
-    :return: go.Figure object.
+    :param output_path: Optional output path.
+    :return: Tuple of (go.Figure object, list of contour_meta dicts).
     :raises ValueError: If Plotly plot structures cannot be parsed from the HTML file.
     """
     path = Path(html_path)
     if not path.is_file():
         raise FileNotFoundError(f"HTML file not found: {path}")
+
+    dest_dir = Path(output_path or html_path).parent
+    base_file_stem = Path(output_path or html_path).stem
 
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
@@ -67,8 +297,6 @@ def extract_plotly_fig(html_path: Union[str, Path]) -> go.Figure:
 
     # Convert layout shapes to scatter traces so tikzplotly can draw them
     if "shapes" in layout and isinstance(layout["shapes"], list):
-        # We need a temporary Figure just to build the traces easily,
-        # or we can directly build dict traces.
         pass
 
     fig = go.Figure(data=data, layout=layout)
@@ -96,7 +324,87 @@ def extract_plotly_fig(html_path: Union[str, Path]) -> go.Figure:
                 )
                 fig.add_trace(trace)
 
-    return fig
+    # Convert scattergl and contour traces to supported formats
+    processed_traces = []
+    contour_metas = []
+    contour_count = 0
+    
+    for trace in fig.data:
+        if trace.type == "scattergl":
+            # Convert to standard scatter by converting to dict and changing type
+            trace_dict = trace.to_plotly_json()
+            trace_dict["type"] = "scatter"
+            if "name" in trace_dict and trace_dict["name"]:
+                trace_dict["name"] = clean_identifier(trace_dict["name"])
+            processed_traces.append(trace_dict)
+        elif trace.type == "contour":
+            # Convert to multiple scatter traces using matplotlib
+            try:
+                bg_stem = f"{base_file_stem}_contour_bg_{contour_count}" if contour_count > 0 else f"{base_file_stem}_contour_bg"
+                scatters, meta = convert_contour_to_scatters(trace, dest_dir=dest_dir, base_filename=bg_stem)
+                processed_traces.extend(scatters)
+                if meta:
+                    contour_metas.append(meta)
+                contour_count += 1
+            except Exception:
+                processed_traces.append(trace)
+        else:
+            if hasattr(trace, "name") and trace.name:
+                trace.name = clean_identifier(trace.name)
+            processed_traces.append(trace)
+
+    fig = go.Figure(data=processed_traces, layout=fig.layout)
+
+    return fig, contour_metas
+
+
+def fix_latex_title(text: str) -> str:
+    """
+    Transforms MathJax formatted title strings like:
+    '$\\text{Lyapunov Landscape (} x \\text{ vs } v \\text{) with ROA level } 586$'
+    or its mangled TeX version into clean LaTeX:
+    'Lyapunov Landscape ($x$ vs $v$) with ROA level $586$'
+    """
+    if not text:
+        return text
+
+    # Unescape any hex or backslash sanitization artifacts
+    text = text.replace(r"\text\{", r"\text{").replace(r"\textx7b", r"\text{")
+    text = text.replace(r"\}", "}").replace(r"x7d", "}").replace(r"\{", "{").replace(r"x7b", "{")
+    
+    trimmed = text.strip()
+    if trimmed.startswith("$") and trimmed.endswith("$") and (r"\text" in trimmed or r"\text{" in trimmed):
+        inner = trimmed[1:-1].strip()
+        parts = re.split(r'\\text\{([^}]*)\}', inner)
+        
+        result = []
+        for i, part in enumerate(parts):
+            if i % 2 == 1:
+                result.append(part)
+            else:
+                if not part:
+                    continue
+                def wrap_math(match):
+                    val = match.group(0)
+                    return f"${val}$"
+                part_converted = re.sub(r'[a-zA-Z0-9_\-\+\*\./]+', wrap_math, part)
+                result.append(part_converted)
+                
+        res_str = "".join(result)
+        res_str = re.sub(r'\(\s*', '(', res_str)
+        res_str = re.sub(r'\s*\)', ')', res_str)
+        res_str = re.sub(r'\s+', ' ', res_str).strip()
+        return res_str
+
+    return text
+
+
+def fix_tikz_title(code: str) -> str:
+    def replace_title(match):
+        title_body = match.group(1)
+        fixed_body = fix_latex_title(title_body)
+        return f"title={{{fixed_body}}}"
+    return re.sub(r"title=\{(.*)\}(?=,|\n|$)", replace_title, code)
 
 
 def convert_html_to_tikz(
@@ -116,7 +424,51 @@ def convert_html_to_tikz(
     else:
         dest_path = src_path.with_suffix(".tex")
 
-    fig = extract_plotly_fig(src_path)
-    tikzplotly.save(str(dest_path), fig)
+    fig, contour_metas = extract_plotly_fig(src_path, dest_path)
+    
+    # Process layout title if present
+    if hasattr(fig.layout, 'title') and fig.layout.title and hasattr(fig.layout.title, 'text') and fig.layout.title.text:
+        fig.layout.title.text = fix_latex_title(fig.layout.title.text)
+
+    tikz_code = tikzplotly.get_tikz_code(fig)
+    
+    # Apply title formatting and clean up residual x7b/x7d hex escape sequences
+    tikz_code = fix_tikz_title(tikz_code)
+    tikz_code = tikz_code.replace("x7b", "{").replace("x7d", "}")
+
+    # Inject contour background image and colorbar if contour metadata is available
+    if contour_metas:
+        meta = contour_metas[0]
+        cmap_name = meta.get('cmap', 'viridis')
+        levels = meta.get('levels', [])
+        
+        colorbar_style_str = ""
+        if levels:
+            ytick_vals = ", ".join([f"{lvl:.0f}" if lvl == int(lvl) else f"{lvl:.1f}" for lvl in levels])
+            colorbar_style_str = f"colorbar style={{ytick={{{ytick_vals}}}}},\n"
+            
+        axis_options_add = (
+            f"colorbar,\n"
+            f"{colorbar_style_str}"
+            f"colormap/{cmap_name},\n"
+            f"point meta min={meta['zmin']:.4f},\n"
+            f"point meta max={meta['zmax']:.4f},"
+        )
+        tikz_code = re.sub(r'(\\begin\{axis\}\[\n?)', r'\1' + axis_options_add + '\n', tikz_code, count=1)
+        
+        graphics_code = (
+            f"\\addplot graphics [xmin={meta['xmin']}, xmax={meta['xmax']}, "
+            f"ymin={meta['ymin']}, ymax={meta['ymax']}] {{{meta['bg_filename']}}};\n"
+        )
+        
+        axis_begin_end = re.search(r'\\begin\{axis\}\[.*?\]\n?', tikz_code, re.DOTALL)
+        if axis_begin_end:
+            insert_pos = axis_begin_end.end()
+            tikz_code = tikz_code[:insert_pos] + graphics_code + tikz_code[insert_pos:]
+
+    if not dest_path.parent.exists():
+        dest_path.parent.mkdir(parents=True)
+    with open(dest_path, "w", encoding="utf-8") as fd:
+        fd.write(tikz_code)
 
     return dest_path
