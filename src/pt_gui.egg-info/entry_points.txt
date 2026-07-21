@@ -1,0 +1,3 @@
+[console_scripts]
+ptg = ptg.cli:main
+ptg-gui = ptg.gui:main
